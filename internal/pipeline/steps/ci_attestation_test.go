@@ -837,6 +837,107 @@ func TestPushStep_PushFailureAfterAttestationLeavesBodyAhead(t *testing.T) {
 	}
 }
 
+// TestPushStep_RejectsTargetRefEvenWhenRemoteHasCommit exercises the delivery
+// boundary that a commit-object lookup cannot prove. A local bare remote is
+// deliberately seeded with the new object under a private ref, then its
+// pre-receive hook rejects the public target ref. The Push step must preserve
+// that rejection and must not record or render a successful publication.
+func TestPushStep_RejectsTargetRefEvenWhenRemoteHasCommit(t *testing.T) {
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+
+	dir, baseSHA, priorHead := setupGitRepo(t)
+	gitCmd(t, dir, "remote", "add", "origin", upstream)
+	gitCmd(t, dir, "push", "origin", "main")
+	gitCmd(t, dir, "push", "origin", "feature")
+
+	if err := os.WriteFile(filepath.Join(dir, "new-work.txt"), []byte("new work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "new work")
+	newHead := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	// The bare remote already has the commit object, but not at the delivery
+	// ref. This is intentionally not evidence of publication.
+	gitCmd(t, dir, "push", "origin", newHead+":refs/no-mistakes/object-probe")
+	hook := "#!/bin/sh\n" +
+		"while read _old _new ref; do\n" +
+		"  if [ \"$ref\" = \"refs/heads/feature\" ]; then\n" +
+		"    echo 'fatal: commit_refs: target ref rejected' >&2\n" +
+		"    exit 1\n" +
+		"  fi\n" +
+		"done\n"
+	if err := os.WriteFile(filepath.Join(upstream, "hooks", "pre-receive"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	prURL := "https://github.com/test/repo/pull/42"
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, newHead, config.Commands{})
+	sctx.Repo.UpstreamURL = upstream
+	sctx.Run.Branch = "refs/heads/feature"
+	sctx.Run.PRURL = &prURL
+	setupGateMirror(t, sctx)
+	recordReviewApproval(t, sctx, newHead)
+	for _, name := range []types.StepName{types.StepReview, types.StepTest, types.StepDocument, types.StepPush} {
+		sr, err := sctx.DB.InsertStepResult(sctx.Run.ID, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name != types.StepPush {
+			if err := sctx.DB.UpdateStepStatus(sr.ID, types.StepStatusCompleted); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	bodyFile := filepath.Join(t.TempDir(), "pr-body.md")
+	if err := os.WriteFile(bodyFile, []byte(compliantPipelineBody(t, priorHead)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sctx.Env = append(fakeCIGH(t, "OPEN", `[]`),
+		"FAKE_CLI_PR_LIST_JSON=[{\"number\":42,\"url\":\"https://github.com/test/repo/pull/42\",\"baseRefName\":\"main\"}]",
+		"FAKE_CLI_PR_BODY_FILE="+bodyFile,
+		"FAKE_CLI_PR_TITLE=fix: existing pr",
+	)
+	var modelSummary []string
+	sctx.Log = func(message string) { modelSummary = append(modelSummary, message) }
+
+	_, err := (&PushStep{}).Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), "commit_refs") {
+		t.Fatalf("Execute() error = %v, want the original remote rejection", err)
+	}
+
+	// The remote can resolve the commit object, but its target ref still proves
+	// that delivery failed.
+	gitCmd(t, upstream, "cat-file", "-e", newHead+"^{commit}")
+	if got := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); got != priorHead {
+		t.Fatalf("target ref = %s, want unchanged %s", got, priorHead)
+	}
+
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.LastPushedSHA != nil {
+		t.Fatalf("persisted publication = %q, want no publication after target-ref rejection", *run.LastPushedSHA)
+	}
+
+	body, err := os.ReadFile(bodyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestation := parsePipelineAttestationForTest(t, string(body))
+	for _, step := range attestation.Steps {
+		if step.Step == types.StepPush && step.Status == types.StepStatusCompleted {
+			t.Fatalf("attestation marks rejected Push completed: %+v", step)
+		}
+	}
+	if strings.Contains(string(body), "Push - passed") || strings.Contains(strings.Join(modelSummary, "\n"), "pushed successfully") {
+		t.Fatalf("delivery rejection was rendered as success: body=%q summary=%q", body, modelSummary)
+	}
+}
+
 // TestPushStep_DoesNotMintAttestation confirms attestHeadBeforePush is
 // strictly a rebind of an EXISTING attestation and never mints one for a PR
 // that was not raised through no-mistakes.
